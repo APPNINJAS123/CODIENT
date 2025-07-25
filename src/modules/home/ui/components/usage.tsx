@@ -48,7 +48,7 @@ const resetTime=useMemo(()=>{
                 <Button
                 asChild
                 size="sm"
-                variant="tertiary"
+                
                 className="ml-auto"
                 
                 >
