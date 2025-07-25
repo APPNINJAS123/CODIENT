@@ -1,0 +1,17 @@
+# This is a config for E2B sandbox template.
+# You can use template ID (ldk7qflvtiwrwt00xcwe) or template name (apple-vibe-test) to create a sandbox:
+
+# Python SDK
+# from e2b import Sandbox, AsyncSandbox
+# sandbox = Sandbox("apple-vibe-test") # Sync sandbox
+# sandbox = await AsyncSandbox.create("apple-vibe-test") # Async sandbox
+
+# JS SDK
+# import { Sandbox } from 'e2b'
+# const sandbox = await Sandbox.create('apple-vibe-test')
+
+team_id = "483431f3-deb0-40ac-adeb-7348c6bfe6b7"
+start_cmd = "/compile_page.sh"
+dockerfile = "e2b.Dockerfile"
+template_name = "apple-vibe-test"
+template_id = "ldk7qflvtiwrwt00xcwe"
