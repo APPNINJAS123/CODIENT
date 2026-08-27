@@ -55,7 +55,7 @@ jobs:
 
       - id: proposal
         name: Produce the offline proposal artifact
-        uses: APPNINJAS123/automated-api-test-action@7db727d8b7cd2a056bedeba928e085690629642f
+        uses: APPNINJAS123/automated-api-test-action@fc462e2db1f9ec58ec5eb8dfa2a47bc94dd22f43
         with:
           job-path: ${{ steps.job.outputs.job_path }}
           job-sha256: ${{ steps.job.outputs.job_sha256 }}
@@ -98,7 +98,7 @@ jobs:
       - id: harness_proposal
         if: steps.harness.outputs.required == 'true'
         name: Validate the Harness edit offline
-        uses: APPNINJAS123/automated-api-test-action@7db727d8b7cd2a056bedeba928e085690629642f
+        uses: APPNINJAS123/automated-api-test-action@fc462e2db1f9ec58ec5eb8dfa2a47bc94dd22f43
         with:
           job-path: ${{ steps.job.outputs.job_path }}
           job-sha256: ${{ steps.job.outputs.job_sha256 }}
