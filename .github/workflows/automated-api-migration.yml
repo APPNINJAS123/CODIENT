@@ -1,0 +1,174 @@
+name: Automated API migration proposal
+run-name: Automated API proposal ${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Opaque migration job identifier
+        required: true
+        type: string
+      base_sha:
+        description: Full immutable customer repository commit SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: automated-api-${{ github.repository }}-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  propose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the fixed customer revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.base_sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - id: job
+        name: Fetch the opaque migration job
+        env:
+          CONTROL_PLANE_URL: ${{ vars.AUTOMATED_API_CONTROL_PLANE_URL }}
+          JOB_ID: ${{ inputs.job_id }}
+          JOB_TOKEN: ${{ secrets.AUTOMATED_API_JOB_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "${CONTROL_PLANE_URL}"
+          test -n "${JOB_TOKEN}"
+          case "${CONTROL_PLANE_URL}" in https://*) ;; *) echo "Control plane URL must use HTTPS" >&2; exit 2;; esac
+          response="${RUNNER_TEMP}/automated-api-job-response.json"
+          job_path="${RUNNER_TEMP}/automated-api-job.json"
+          curl --fail --silent --show-error --header "Authorization: Bearer ${JOB_TOKEN}" "${CONTROL_PLANE_URL%/}/internal/migration-jobs/${JOB_ID}" --output "${response}"
+          RESPONSE="${response}" JOB_PATH="${job_path}" node --input-type=module -e "import fs from 'node:fs'; const value=JSON.parse(fs.readFileSync(process.env.RESPONSE,'utf8')); fs.writeFileSync(process.env.JOB_PATH,Buffer.from(value.jobBase64,'base64')); fs.appendFileSync(process.env.GITHUB_OUTPUT,'job_path='+process.env.JOB_PATH+'\njob_sha256='+value.sha256+'\n')"
+
+      - id: proposal
+        name: Produce the offline proposal artifact
+        uses: APPNINJAS123/automated-api-test-action@7db727d8b7cd2a056bedeba928e085690629642f
+        with:
+          job-path: ${{ steps.job.outputs.job_path }}
+          job-sha256: ${{ steps.job.outputs.job_sha256 }}
+          output-directory: ${{ runner.temp }}/automated-api-output
+
+      - id: harness
+        name: Request and wait for Harness only when analysis abstains
+        env:
+          CONTROL_PLANE_URL: ${{ vars.AUTOMATED_API_CONTROL_PLANE_URL }}
+          JOB_ID: ${{ inputs.job_id }}
+          JOB_TOKEN: ${{ secrets.AUTOMATED_API_JOB_TOKEN }}
+          OUTPUT_DIRECTORY: ${{ steps.proposal.outputs.output-directory }}
+        run: |
+          set -euo pipefail
+          status="$(OUTPUT="${OUTPUT_DIRECTORY}" node --input-type=module -e "import fs from 'node:fs'; import path from 'node:path'; process.stdout.write(JSON.parse(fs.readFileSync(path.join(process.env.OUTPUT,'result.json'),'utf8')).status)")"
+          if [ "${status}" != harness_required ]; then
+            echo "required=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          callback="${RUNNER_TEMP}/automated-api-harness-request.json"
+          CALLBACK="${callback}" OUTPUT="${OUTPUT_DIRECTORY}" node --input-type=module -e "import fs from 'node:fs'; import path from 'node:path'; const result=JSON.parse(fs.readFileSync(path.join(process.env.OUTPUT,'result.json'),'utf8')); fs.writeFileSync(process.env.CALLBACK,JSON.stringify({result}))"
+          curl --fail --silent --show-error --request POST --header "Authorization: Bearer ${JOB_TOKEN}" --header "Content-Type: application/json" --data-binary "@${callback}" "${CONTROL_PLANE_URL%/}/internal/migration-jobs/${JOB_ID}/proposal" > /dev/null
+          harness_result="${RUNNER_TEMP}/automated-api-harness-result.json"
+          for attempt in $(seq 1 60); do
+            http_status="$(curl --silent --show-error --output "${harness_result}" --write-out '%{http_code}' --header "Authorization: Bearer ${JOB_TOKEN}" "${CONTROL_PLANE_URL%/}/internal/migration-jobs/${JOB_ID}/harness-result")"
+            if [ "${http_status}" = 200 ]; then
+              echo "required=true" >> "${GITHUB_OUTPUT}"
+              echo "result_path=${harness_result}" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            if [ "${http_status}" != 202 ]; then
+              cat "${harness_result}" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "Harness result timed out" >&2
+          exit 1
+
+      - id: harness_proposal
+        if: steps.harness.outputs.required == 'true'
+        name: Validate the Harness edit offline
+        uses: APPNINJAS123/automated-api-test-action@7db727d8b7cd2a056bedeba928e085690629642f
+        with:
+          job-path: ${{ steps.job.outputs.job_path }}
+          job-sha256: ${{ steps.job.outputs.job_sha256 }}
+          output-directory: ${{ runner.temp }}/automated-api-harness-output
+          harness-result-path: ${{ steps.harness.outputs.result_path }}
+
+      - id: final
+        name: Select the validated proposal output
+        env:
+          HARNESS_REQUIRED: ${{ steps.harness.outputs.required }}
+          INITIAL_OUTPUT: ${{ steps.proposal.outputs.output-directory }}
+          HARNESS_OUTPUT: ${{ steps.harness_proposal.outputs.output-directory }}
+        run: |
+          set -euo pipefail
+          if [ "${HARNESS_REQUIRED}" = true ]; then
+            echo "output_directory=${HARNESS_OUTPUT}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "output_directory=${INITIAL_OUTPUT}" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - id: upload
+        name: Upload the proposal without repository credentials
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: automated-api-proposal-${{ inputs.job_id }}
+          path: ${{ steps.final.outputs.output_directory }}
+          retention-days: 1
+          if-no-files-found: error
+
+      - id: callback
+        name: Return the verified artifact to the control plane
+        env:
+          CONTROL_PLANE_URL: ${{ vars.AUTOMATED_API_CONTROL_PLANE_URL }}
+          JOB_ID: ${{ inputs.job_id }}
+          JOB_TOKEN: ${{ secrets.AUTOMATED_API_JOB_TOKEN }}
+          OUTPUT_DIRECTORY: ${{ steps.final.outputs.output_directory }}
+        run: |
+          set -euo pipefail
+          callback="${RUNNER_TEMP}/automated-api-callback.json"
+          CALLBACK="${callback}" OUTPUT="${OUTPUT_DIRECTORY}" node --input-type=module -e "import fs from 'node:fs'; import path from 'node:path'; const result=JSON.parse(fs.readFileSync(path.join(process.env.OUTPUT,'result.json'),'utf8')); const body={result,manifestBase64:fs.existsSync(path.join(process.env.OUTPUT,'manifest.json'))?fs.readFileSync(path.join(process.env.OUTPUT,'manifest.json')).toString('base64'):undefined,patchBase64:fs.existsSync(path.join(process.env.OUTPUT,'proposal.patch'))?fs.readFileSync(path.join(process.env.OUTPUT,'proposal.patch')).toString('base64'):undefined}; fs.writeFileSync(process.env.CALLBACK,JSON.stringify(body))"
+          curl --fail --silent --show-error --request POST --header "Authorization: Bearer ${JOB_TOKEN}" --header "Content-Type: application/json" --data-binary "@${callback}" "${CONTROL_PLANE_URL%/}/internal/migration-jobs/${JOB_ID}/proposal"
+
+      - name: Report a terminal workflow failure
+        if: ${{ always() && steps.callback.outcome != 'success' }}
+        env:
+          CONTROL_PLANE_URL: ${{ vars.AUTOMATED_API_CONTROL_PLANE_URL }}
+          JOB_ID: ${{ inputs.job_id }}
+          JOB_TOKEN: ${{ secrets.AUTOMATED_API_JOB_TOKEN }}
+          JOB_FETCH_OUTCOME: ${{ steps.job.outcome }}
+          PROPOSAL_OUTCOME: ${{ steps.proposal.outcome }}
+          HARNESS_OUTCOME: ${{ steps.harness.outcome }}
+          HARNESS_PROPOSAL_OUTCOME: ${{ steps.harness_proposal.outcome }}
+          FINAL_OUTCOME: ${{ steps.final.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          test -n "${CONTROL_PLANE_URL}"
+          test -n "${JOB_TOKEN}"
+          case "${CONTROL_PLANE_URL}" in https://*) ;; *) echo "Control plane URL must use HTTPS" >&2; exit 2;; esac
+          phase=workflow
+          if [ "${JOB_FETCH_OUTCOME}" != success ]; then phase=job_fetch
+          elif [ "${PROPOSAL_OUTCOME}" != success ]; then phase=proposal
+          elif [ "${HARNESS_OUTCOME}" != success ]; then phase=harness_wait
+          elif [ "${HARNESS_PROPOSAL_OUTCOME}" = failure ]; then phase=harness_validation
+          elif [ "${FINAL_OUTCOME}" != success ]; then phase=artifact_selection
+          elif [ "${UPLOAD_OUTCOME}" != success ]; then phase=artifact_upload
+          else phase=callback_delivery
+          fi
+          failure="${RUNNER_TEMP}/automated-api-execution-failure.json"
+          FAILURE="${failure}" PHASE="${phase}" node --input-type=module -e "import fs from 'node:fs'; fs.writeFileSync(process.env.FAILURE,JSON.stringify({result:{status:'execution_failed',failureCode:'github_actions_step_failed',phase:process.env.PHASE,runId:process.env.RUN_ID,runAttempt:Number(process.env.RUN_ATTEMPT)}}))"
+          curl --fail --silent --show-error --retry 3 --retry-all-errors --request POST --header "Authorization: Bearer ${JOB_TOKEN}" --header "Content-Type: application/json" --data-binary "@${failure}" "${CONTROL_PLANE_URL%/}/internal/migration-jobs/${JOB_ID}/proposal"
